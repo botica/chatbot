@@ -7,7 +7,7 @@ import ollama
 
 MODEL_NAME = 'gemma3:1b'
 SAVE_FILE = 'conversation.json' # output to cd
-MEMORY_SIZE = 5  # number of turns to remember in a session
+MEMORY_SIZE = 10  # number of turns to hold in context
 SYSTEM_PROMPT = '''
 you are an llm powered chatbot.  
 DO NOT END RESPONSES WITH QUESTIONS. 
@@ -15,6 +15,7 @@ DO NOT INSTRUCT THE USER UNLESS EXPLICTLY PROMPTED.
 DO NOT USE EMOJIS.'''
 
 def load_memory():
+    '''loads prior converation or begins new one. returns deque object.'''
     try:
         with open(SAVE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -38,12 +39,15 @@ def build_prompt(user_input, history):
     return "\n".join(conversation)
 
 def chat():
+    ''' waits for user input to query model and return response.
+        the response is printed in the terminal and the process repeats
+    '''
     history = load_memory()
 
     while True:
         try:
             user_input = input("you: ")
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt): # close with ctrl-c to write out
             save_memory(history)
             sys.exit(0)
 
