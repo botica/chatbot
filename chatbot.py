@@ -7,8 +7,9 @@ import ollama
 
 MODEL_NAME = 'gemma3:1b'
 SAVE_FILE = 'conversation.json' # output to cd
-MEMORY_SIZE = 4  # number of past turns to remember in a chat session(user input + bot output is one turn)
-SYSTEM_PROMPT = '''you are an llm powered chatbot. 
+MEMORY_SIZE = 5  # number of turns to remember in a session
+SYSTEM_PROMPT = '''
+you are an llm powered chatbot.  
 DO NOT END RESPONSES WITH QUESTIONS. 
 DO NOT INSTRUCT THE USER UNLESS EXPLICTLY PROMPTED. 
 DO NOT USE EMOJIS.'''
@@ -30,7 +31,7 @@ def save_memory(history):
 
 def build_prompt(user_input, history):
     conversation = [
-        f"user: {t['user']}\nbot: {t['ai']}"
+        f"user: {t['user']}\nbot: {t['bot']}"
         for t in history
     ]
     conversation.append(f"user: {user_input}\nbot:")
@@ -42,7 +43,7 @@ def chat():
     while True:
         try:
             user_input = input("you: ")
-        except (EOFError, KeyboardInterrupt): # close the program with ctrl-c
+        except (EOFError, KeyboardInterrupt):
             save_memory(history)
             sys.exit(0)
 
@@ -59,8 +60,8 @@ def chat():
         ai_output = response["message"]["content"].strip()
         ai_output_utf8 = ai_output.encode("utf-8", errors="replace").decode("utf-8")
         print(f"bot: {ai_output_utf8}")
-        history.append({"user": user_input, "ai": ai_output_utf8})
-        print('\n\n') # temp console spacing
+        history.append({"user": user_input, "bot": ai_output_utf8})
+        print('---')
 
 if __name__ == "__main__":
     chat()
