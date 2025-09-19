@@ -1,3 +1,11 @@
+#refactor
+#extraxt facts before outputing response
+
+# keeps running convo
+# exports facts about user to json and keeps in context as well
+# call llm to get convo resp
+# call llm to extact facts
+
 import json
 import sys
 from collections import deque
@@ -29,32 +37,102 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+def merge_facts(existing, new):
+    '''
+    merge new facts into existing facts. 
+    If a fact already exists and is different, store as a list of values. 
+    If it's the same, ignore.
+    '''
+    for k, v in new.items():
+        if k in existing:
+            if isinstance(existing[k], list):
+                if v not in existing[k]:
+                    existing[k].append(v)
+            else:
+                if existing[k] != v:
+                    existing[k] = [existing[k], v]
+        else:
+            existing[k] = v
+    return existing
+
 def extract_facts(user_input, existing_facts):
-    # Skip extraction if input is a question
-    if user_input.strip().endswith("?"):
-        return existing_facts
-    prompt = f'''
+    '''
+    extracts self-related facts from user input using llm
+    normalizes categories and merges with existing facts.
+    '''
+    extract_system_prompt = '''
+You are a fact extractor.
+Only record facts the USER explicitly states about THEMSELVES.
+
+You may use these categories (or invent a new one if nothing fits):
+- Name
+- Age
+- Gender
+- Location
+- Nationality
+- Ethnicity
+- FormerJob
+- CurrentJob
+- Hobby (activities the user *does* for enjoyment, e.g. "Hiking", "Gaming")
+- Interest (subjects the user *follows or learns about*, e.g. "History", "Astronomy")
+- Preference (foods, drinks, music, or other things the user *likes or dislikes*, e.g. "Potatoes", "Jazz")
+- Trait (adjectives describing the user’s personality, e.g. "Kind", "Curious")
+- Skill (things the user *can do*, e.g. "Cooking", "Programming")
+- Education
+- RelationshipStatus
+- Pet
+- Mood
+
+Guidelines:
+- If the user mentions an *activity they do*, classify it as a Hobby.
+- If the user mentions something they *enjoy or consume* (like food, drinks, music), classify it as a Preference.
+- If the user describes their *personality*, classify it as a Trait.
+- If the fact doesn’t fit any, create a short new category.
+
+Facts must be concise and general (e.g., "FormerJob": "Cook").
+Ignore vague memories, opinions, or random details.
+
+Return valid JSON.
+If no facts, return {}.
+
+Examples:
+
+User: "I love potatoes."
+Output: {"Preference": "Potatoes"}
+
+User: "I like hiking."
+Output: {"Hobby": "Hiking"}
+
+User: "I'm Irish."
+Output: {"Nationality": "Irish"}
+
+User: "I'm good at programming."
+Output: {"Skill": "Programming"}
+
+User: "I’m a happy person."
+Output: {"Trait": "Happy"}
+    '''
+
+    extract_prompt = f'''
 USER INPUT:
 "{user_input}"
 CURRENT FACTS (JSON):
 {json.dumps(existing_facts, indent=2)}
-TASK:
-Update the facts strictly from the USER INPUT.
-Rules:
-- Only add or change facts explicitly stated by the USER about themselves.
-- Do not include any facts about the world, other people, or ephemeral events.
-- Overwrite previous values if the user contradicts a fact.
-- Always return the complete fact set as valid JSON.
+Return only the new or updated facts (not the full set).
+Return valid JSON.
 '''
+
     response = ollama.chat(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "You are a fact extractor. Only record facts explicitly stated by the user about themselves."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": extract_system_prompt},
+            {"role": "user", "content": extract_prompt}
         ]
     )
+
     try:
-        return json.loads(response["message"]["content"])
+        new_facts = json.loads(response["message"]["content"])
+        return merge_facts(existing_facts, new_facts)
     except json.JSONDecodeError:
         return existing_facts
 
@@ -65,7 +143,7 @@ def build_prompt(user_input, history, facts):
         for t in history
     ]
     conversation.append(f"user: {user_input}\nbot:")
-    return f"Known facts about the user:\n{fact_summary}\n\nConversation so far:\n" + "\n".join(conversation)
+    return f"Saved facts about user:\n{fact_summary}\n\nCurrent conversation:\n" + "\n".join(conversation)
 
 def chat():
     history = deque(load_json(SAVE_FILE, {}).get("history", []), maxlen=MEMORY_SIZE)
@@ -91,7 +169,7 @@ def chat():
         history.append({"user": user_input, "bot": ai_output})
         facts = extract_facts(user_input, facts)
         if facts:
-            print("\n[updated facts about user]")
+            print("\n[facts about user]")
             for k, v in facts.items():
                 print(f"- {k}: {v}")
 
