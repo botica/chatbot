@@ -64,6 +64,16 @@ def normalize_facts(facts):
     return {k: normalize_entry(v) for k, v in facts.items()}
 
 def merge_facts(existing, new):
+    """
+    Merge new facts into existing facts with timestamps.
+    Each fact stored as {"value": ..., "timestamp": ...}.
+    Preference/Dislike contradictions overwrite.
+    Mood and singleton categories always overwrite.
+    Other categories can have multiple values.
+    Ensures no nested lists and prevents double timestamps.
+    """
+    SINGLETON_CATEGORIES = {"Age", "Name", "Gender", "Location", "Nationality", "Ethnicity", "Mood"}
+
     for k, v in new.items():
         # If new fact is a list, merge items individually
         if isinstance(v, list):
@@ -96,15 +106,23 @@ def merge_facts(existing, new):
             elif existing["Preference"]["value"] == fact_value:
                 del existing["Preference"]
 
-        elif k == "Mood":
+        # Mood always overwrites
+        if k == "Mood":
             existing["Mood"] = new_fact
             continue
 
-        # Merge normally with flattening
+        # Singleton categories always overwrite
+        if k in SINGLETON_CATEGORIES:
+            existing[k] = new_fact
+            continue
+
+        # Merge normally for multi-value categories
         if k in existing:
+            # Convert dict to list if not already
             if isinstance(existing[k], dict):
                 existing[k] = [existing[k]]
 
+            # Flatten any nested lists
             flat_list = []
             for entry in existing[k]:
                 if isinstance(entry, list):
@@ -113,7 +131,7 @@ def merge_facts(existing, new):
                     flat_list.append(entry)
             existing[k] = flat_list
 
-            # Add new_fact if not duplicate
+            # Append new_fact if not duplicate
             if all(entry["value"] != fact_value for entry in existing[k]):
                 existing[k].append(new_fact)
         else:
