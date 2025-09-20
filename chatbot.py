@@ -51,21 +51,27 @@ def normalize_facts(facts):
                 return {"value": val, "timestamp": ts}
             return {k: normalize_entry(v) for k, v in entry.items()}
         elif isinstance(entry, list):
-            return [normalize_entry(e) for e in entry]
+            flat_list = []
+            for e in entry:
+                ne = normalize_entry(e)
+                if isinstance(ne, list):
+                    flat_list.extend(ne)
+                else:
+                    flat_list.append(ne)
+            return flat_list
         return entry
 
     return {k: normalize_entry(v) for k, v in facts.items()}
 
 def merge_facts(existing, new):
-    """
-    Merge new facts into existing facts with timestamps.
-    Each fact stored as {"value": ..., "timestamp": ...}.
-    Preference/Dislike contradictions overwrite.
-    Mood always overwrites.
-    Other categories can have multiple values.
-    """
     for k, v in new.items():
-        # Ensure v is just the value, not a nested dict
+        # If new fact is a list, merge items individually
+        if isinstance(v, list):
+            for item in v:
+                merge_facts(existing, {k: item})
+            continue
+
+        # Extract the actual value
         if isinstance(v, dict) and "value" in v:
             fact_value = v["value"]
         else:
@@ -73,7 +79,7 @@ def merge_facts(existing, new):
 
         new_fact = {"value": fact_value, "timestamp": timestamp()}
 
-        # Handle Preference/Dislike contradictions
+        # Preference/Dislike contradictions
         if k == "Preference" and "Dislike" in existing:
             if isinstance(existing["Dislike"], list):
                 existing["Dislike"] = [d for d in existing["Dislike"] if d["value"] != fact_value]
@@ -94,14 +100,22 @@ def merge_facts(existing, new):
             existing["Mood"] = new_fact
             continue
 
-        # Merge normally
+        # Merge normally with flattening
         if k in existing:
-            if isinstance(existing[k], list):
-                if all(entry["value"] != fact_value for entry in existing[k]):
-                    existing[k].append(new_fact)
-            elif isinstance(existing[k], dict):
-                if existing[k]["value"] != fact_value:
-                    existing[k] = [existing[k], new_fact]
+            if isinstance(existing[k], dict):
+                existing[k] = [existing[k]]
+
+            flat_list = []
+            for entry in existing[k]:
+                if isinstance(entry, list):
+                    flat_list.extend(entry)
+                else:
+                    flat_list.append(entry)
+            existing[k] = flat_list
+
+            # Add new_fact if not duplicate
+            if all(entry["value"] != fact_value for entry in existing[k]):
+                existing[k].append(new_fact)
         else:
             existing[k] = new_fact
 
@@ -110,15 +124,15 @@ def merge_facts(existing, new):
 def extract_facts(user_input, existing_facts):
     extract_system_prompt = '''
 You are a fact extractor.
-Only record facts the USER explicitly states about THEMSELVES.
+ONLY record facts the USER explicitly states about THEMSELVES.
 
 Strict rules:
-- Do NOT infer facts. Only store if user clearly says "I am...", "I like...", "I love...", "I enjoy...", "I eat...", "I drink...", or "my name is...".
-- If the user says their name explicitly ("my name is X" or "I am called X") → {"Name": "X"}.
-- If the user says they LIKE, LOVE, ENJOY, or frequently CONSUME something → {"Preference": "..."}.
-- If the user says they DISLIKE or DON'T LIKE something → {"Dislike": "..."}.
-- If the user describes their MOOD explicitly using "I feel", "I'm feeling", or "I am [emotion]" → {"Mood": "..."}.
-- Never record a Mood unless explicitly stated. Do not guess or infer.
+- Do NOT infer facts. Only record if the user clearly says:
+    "I am...", "I like...", "I love...", "I enjoy...", "I eat...", "I drink...", or "my name is...".
+- Do NOT record anything the user mentions about other people, animals, or things in general.
+- Do NOT record facts if the user is asking a question, speculating, or making general statements.
+- Only record facts explicitly about the USER.
+- Do not assume preferences, dislikes, or traits unless explicitly stated by the user.
 
 Categories you may use:
 - Name, Age, Gender, Location, Nationality, Ethnicity, FormerJob, CurrentJob
