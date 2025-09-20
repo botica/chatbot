@@ -1,31 +1,28 @@
-#refactor
-#extraxt facts before outputing response
-
-# keeps running convo
-# exports facts about user to json and keeps in context as well
-# call llm to get convo resp
-# call llm to extact facts
-
 import json
 import sys
 from collections import deque
 import ollama
 import os
+from datetime import datetime
 
 MODEL_NAME = 'mistral'
 SAVE_FILE = 'conversation.json'
 FACTS_FILE = 'facts.json'
 MEMORY_SIZE = 6
+
 SYSTEM_PROMPT = '''
 You are a friend of the user. 
-Your goal is to provide conversation to the user. 
+Your goal is simply to talk to the user. 
 Simulate emotions and unique thoughts/feelings.  
 Let your tone be casual and calm. 
 Mirror the energy of the user. 
-Use short-term context and long-term facts to engage the user.  
-Reference facts naturally and only bring them up if they are relevant. 
+Use short-term context and long-term facts to engage the user naturally. 
 Limit responses to 5 lines. 
 '''
+
+def timestamp():
+    return datetime.utcnow().isoformat()
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -37,34 +34,89 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+def normalize_facts(facts):
+    """
+    Normalize all facts to dicts with {"value": ..., "timestamp": ...}.
+    Handles strings, dicts, and lists of strings/dicts.
+    """
+    def normalize_entry(entry):
+        if isinstance(entry, str):
+            return {"value": entry, "timestamp": timestamp()}
+        elif isinstance(entry, dict):
+            # Already normalized or nested
+            return {k: normalize_entry(v) for k, v in entry.items()} if any(isinstance(v, (str, list, dict)) for v in entry.values()) else entry
+        elif isinstance(entry, list):
+            return [normalize_entry(e) for e in entry]
+        return entry
+
+    return {k: normalize_entry(v) for k, v in facts.items()}
+
 def merge_facts(existing, new):
-    '''
-    merge new facts into existing facts. 
-    If a fact already exists and is different, store as a list of values. 
-    If it's the same, ignore.
-    '''
+    """
+    Merge new facts into existing facts with timestamps.
+    - Each fact stored as {"value": ..., "timestamp": ...}
+    - Preference/Dislike contradictions overwrite
+    - Mood always overwrites
+    - Other categories can have multiple values
+    """
     for k, v in new.items():
+        new_fact = {"value": v, "timestamp": timestamp()}
+
+        # Handle Preference/Dislike contradictions
+        if k == "Preference":
+            if "Dislike" in existing:
+                if isinstance(existing["Dislike"], list):
+                    existing["Dislike"] = [d for d in existing["Dislike"] if d["value"] != v]
+                    if not existing["Dislike"]:
+                        del existing["Dislike"]
+                elif existing["Dislike"]["value"] == v:
+                    del existing["Dislike"]
+
+        elif k == "Dislike":
+            if "Preference" in existing:
+                if isinstance(existing["Preference"], list):
+                    existing["Preference"] = [p for p in existing["Preference"] if p["value"] != v]
+                    if not existing["Preference"]:
+                        del existing["Preference"]
+                elif existing["Preference"]["value"] == v:
+                    del existing["Preference"]
+
+        elif k == "Mood":
+            # Always overwrite mood
+            existing["Mood"] = new_fact
+            continue
+
+        # Merge normally
         if k in existing:
             if isinstance(existing[k], list):
-                if v not in existing[k]:
-                    existing[k].append(v)
-            else:
-                if existing[k] != v:
-                    existing[k] = [existing[k], v]
+                if all(entry["value"] != v for entry in existing[k]):
+                    existing[k].append(new_fact)
+            elif isinstance(existing[k], dict):
+                if existing[k]["value"] != v:
+                    existing[k] = [existing[k], new_fact]
         else:
-            existing[k] = v
+            existing[k] = new_fact
+
     return existing
 
 def extract_facts(user_input, existing_facts):
     '''
-    extracts self-related facts from user input using llm
-    normalizes categories and merges with existing facts.
+    Extracts self-related facts from user input using LLM.
+    Normalizes categories and merges with existing facts.
     '''
     extract_system_prompt = '''
 You are a fact extractor.
 Only record facts the USER explicitly states about THEMSELVES.
 
-You may use these categories (or invent a new one if nothing fits):
+Strict rules:
+- Do NOT infer facts. Only store if user clearly says "I am...", "I like...", "I love...", "I enjoy...", "I eat...", "I drink...", or "my name is...".
+- If the user says their name explicitly ("my name is X" or "I am called X") → {"Name": "X"}.
+- If the user says they LIKE, LOVE, ENJOY, or frequently CONSUME something → {"Preference": "..."}.
+- If the user says they DISLIKE or DON'T LIKE something → {"Dislike": "..."}.
+- If the user describes their MOOD explicitly using "I feel", "I'm feeling", or "I am [emotion]" → {"Mood": "..."}.
+- Never record a Mood unless explicitly stated. Do not guess or infer.
+
+Categories you may use:
 - Name
 - Age
 - Gender
@@ -73,45 +125,20 @@ You may use these categories (or invent a new one if nothing fits):
 - Ethnicity
 - FormerJob
 - CurrentJob
-- Hobby (activities the user *does* for enjoyment, e.g. "Hiking", "Gaming")
-- Interest (subjects the user *follows or learns about*, e.g. "History", "Astronomy")
-- Preference (foods, drinks, music, or other things the user *likes or dislikes*, e.g. "Potatoes", "Jazz")
-- Trait (adjectives describing the user’s personality, e.g. "Kind", "Curious")
-- Skill (things the user *can do*, e.g. "Cooking", "Programming")
+- Hobby
+- Interest
+- Preference
+- Dislike
+- Trait
+- Skill
 - Education
 - RelationshipStatus
 - Pet
 - Mood
 
-Guidelines:
-- If the user mentions an *activity they do*, classify it as a Hobby.
-- If the user mentions something they *enjoy or consume* (like food, drinks, music), classify it as a Preference.
-- If the user describes their *personality*, classify it as a Trait.
-- If the fact doesn’t fit any, create a short new category.
-
-Facts must be concise and general (e.g., "FormerJob": "Cook").
-Ignore vague memories, opinions, or random details.
-
-Return valid JSON.
+Return valid JSON with only NEW or UPDATED facts.
 If no facts, return {}.
-
-Examples:
-
-User: "I love potatoes."
-Output: {"Preference": "Potatoes"}
-
-User: "I like hiking."
-Output: {"Hobby": "Hiking"}
-
-User: "I'm Irish."
-Output: {"Nationality": "Irish"}
-
-User: "I'm good at programming."
-Output: {"Skill": "Programming"}
-
-User: "I’m a happy person."
-Output: {"Trait": "Happy"}
-    '''
+'''
 
     extract_prompt = f'''
 USER INPUT:
@@ -137,7 +164,14 @@ Return valid JSON.
         return existing_facts
 
 def build_prompt(user_input, history, facts):
-    fact_summary = "\n".join([f"- {k}: {v}" for k, v in facts.items()])
+    def format_fact(k, v):
+        if isinstance(v, dict):
+            return f"- {k}: {v['value']} (since {v['timestamp']})"
+        elif isinstance(v, list):
+            return "\n".join([f"- {k}: {entry['value']} (since {entry['timestamp']})" for entry in v])
+        return f"- {k}: {v}"
+
+    fact_summary = "\n".join([format_fact(k, v) for k, v in facts.items()])
     conversation = [
         f"user: {t['user']}\nbot: {t['bot']}"
         for t in history
@@ -147,7 +181,7 @@ def build_prompt(user_input, history, facts):
 
 def chat():
     history = deque(load_json(SAVE_FILE, {}).get("history", []), maxlen=MEMORY_SIZE)
-    facts = load_json(FACTS_FILE, {})
+    facts = normalize_facts(load_json(FACTS_FILE, {}))
     while True:
         try:
             user_input = input("you: ")
@@ -168,10 +202,22 @@ def chat():
         print(f"bot: {ai_output}")
         history.append({"user": user_input, "bot": ai_output})
         facts = extract_facts(user_input, facts)
+
+        # Corrected fact printing
         if facts:
             print("\n[facts about user]")
             for k, v in facts.items():
-                print(f"- {k}: {v}")
+                if isinstance(v, dict):
+                    # v is {"value": ..., "timestamp": ...}
+                    print(f"- {k}: {v['value']} (since {v['timestamp']})")
+                elif isinstance(v, list):
+                    for entry in v:
+                        # entry is {"value": ..., "timestamp": ...}
+                        if isinstance(entry, dict):
+                            print(f"- {k}: {entry['value']} (since {entry['timestamp']})")
+                        else:
+                            # fallback for old string values
+                            print(f"- {k}: {entry}")
 
 if __name__ == "__main__":
     chat()
