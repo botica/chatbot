@@ -1,5 +1,8 @@
 import json
 import sys
+import time
+import random
+import threading
 from collections import deque
 import ollama
 from datetime import datetime
@@ -16,14 +19,12 @@ Your goal is to have natural, casual conversations.
 Mirror the user’s energy and current mood when appropriate.
 Use short, engaging responses (max 5 lines).
 Acknowledge explicit user facts politely.
-If you know the user’s PreferredName, use it instead of full Name.
+If you know the user’s PreferredName, use it instead of Name.
 '''
 
-# ---------------- Timestamp ----------------
 def timestamp():
     return datetime.utcnow().isoformat()
 
-# ---------------- JSON Helpers ----------------
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -35,9 +36,7 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# ---------------- Facts Helpers ----------------
 def normalize_facts(facts):
-    """Normalize all facts to dicts with value + timestamp, flattening recursively."""
     def normalize_entry(entry):
         if isinstance(entry, str):
             return {"value": entry, "timestamp": timestamp()}
@@ -59,23 +58,17 @@ def normalize_facts(facts):
                     flat_list.append(ne)
             return flat_list
         return entry
-
     return {k: normalize_entry(v) for k, v in facts.items()}
 
 def merge_facts(existing, new):
-    """Merge new facts into existing, handling singleton categories and duplicates."""
     SINGLETON_CATEGORIES = {"Age", "Name", "Gender", "Location", "Nationality", "Ethnicity", "Mood"}
-
     for k, v in new.items():
         if isinstance(v, list):
             for item in v:
                 merge_facts(existing, {k: item})
             continue
-
         fact_value = v["value"] if isinstance(v, dict) and "value" in v else v
         new_fact = {"value": fact_value, "timestamp": timestamp()}
-
-        # Handle contradictions
         if k == "Preference" and "Dislike" in existing:
             if isinstance(existing["Dislike"], list):
                 existing["Dislike"] = [d for d in existing["Dislike"] if d["value"] != fact_value]
@@ -90,18 +83,12 @@ def merge_facts(existing, new):
                     del existing["Preference"]
             elif existing["Preference"]["value"] == fact_value:
                 del existing["Preference"]
-
-        # Mood overwrites
         if k == "Mood":
             existing["Mood"] = new_fact
             continue
-
-        # Singleton overwrite
         if k in SINGLETON_CATEGORIES:
             existing[k] = new_fact
             continue
-
-        # Merge multi-value
         if k in existing:
             if isinstance(existing[k], dict):
                 existing[k] = [existing[k]]
@@ -116,11 +103,9 @@ def merge_facts(existing, new):
                 existing[k].append(new_fact)
         else:
             existing[k] = new_fact
-
     return existing
 
 def dedupe_facts(facts):
-    """Remove near-duplicates in multi-value categories (substrings etc.)."""
     for k, v in list(facts.items()):
         if isinstance(v, list):
             unique = []
@@ -134,29 +119,8 @@ def dedupe_facts(facts):
             facts[k] = unique
     return facts
 
-# ---------------- Explicit Self-Fact Patterns ----------------
-SELF_FACT_PATTERNS = [
-    r"\bi am\b", r"\bi'm\b", r"\bmy name is\b", r"\bi like\b", r"\bi love\b",
-    r"\bi enjoy\b", r"\bi hate\b", r"\bi dislike\b", r"\bi play\b", r"\bi watch\b",
-    r"\bi read\b", r"\bi eat\b", r"\bi drink\b", r"\bi live in\b", r"\bi'm from\b",
-    r"\bi work as\b", r"\bmy job is\b", r"\bi know how to\b", r"\bi'm good at\b",
-]
-
-def is_explicit_self_fact(user_input: str) -> bool:
-    """Check if user input matches any explicit self-fact pattern."""
-    text = user_input.lower()
-    return any(re.search(pat, text) for pat in SELF_FACT_PATTERNS)
-
-# ---------------- Fact Extraction ----------------
 def extract_facts(user_input, existing_facts):
-    """
-    Extract explicit self-facts from user input.
-    Handles 'call me X' as PreferredName.
-    Captures moods from common patterns.
-    """
     user_input_lower = user_input.lower()
-
-    # Explicit self-fact patterns
     SELF_FACT_PATTERNS = [
         r"\bi am\b", r"\bi'm\b", r"\bmy name is\b", r"\bi like\b", r"\bi love\b",
         r"\bi enjoy\b", r"\bi hate\b", r"\bi dislike\b", r"\bi play\b", r"\bi watch\b",
@@ -164,28 +128,20 @@ def extract_facts(user_input, existing_facts):
         r"\bi work as\b", r"\bmy job is\b", r"\bi know how to\b", r"\bi'm good at\b",
         r"\bcall me\b"
     ]
-
-    # Mood-specific patterns (fixed)
     MOOD_PATTERNS = [
-        r"\bi feel\s+([a-zA-Z ]+)",                   # I feel happy
-        r"\bi felt\s+([a-zA-Z ]+)",                   # I felt sad
-        r"\bthat made me\s+([a-zA-Z ]+)",            # That made me excited
-        r"\bi am\s+(?:feeling\s+)?([a-zA-Z]{1,20})\b",   # I am anxious / I am feeling tired
-        r"\bi'm\s+(?:feeling\s+)?([a-zA-Z]{1,20})\b"     # I'm anxious / I'm feeling tired
+        r"\bi feel\s+([a-zA-Z ]{1,30})",
+        r"\bi felt\s+([a-zA-Z ]{1,30})",
+        r"\bthat made me\s+([a-zA-Z ]{1,30})",
+        r"\bi am\s+(?:feeling\s+)?([a-zA-Z ]{1,30})\b",
+        r"\bi'm\s+(?:feeling\s+)?([a-zA-Z ]{1,30})\b"
     ]
 
-    # Skip extraction if no patterns match
-    if not any(re.search(pat, user_input_lower) for pat in SELF_FACT_PATTERNS + MOOD_PATTERNS):
-        return existing_facts
-
-    # Handle "call me X" as PreferredName
     match = re.search(r"call me\s+([A-Za-z0-9_ ]+)", user_input, re.IGNORECASE)
     if match:
         nickname = match.group(1).strip()
         existing_facts["PreferredName"] = {"value": nickname, "timestamp": timestamp()}
         return dedupe_facts(existing_facts)
 
-    # Handle mood patterns
     for pat in MOOD_PATTERNS:
         mood_match = re.search(pat, user_input, re.IGNORECASE)
         if mood_match:
@@ -193,31 +149,22 @@ def extract_facts(user_input, existing_facts):
             existing_facts["Mood"] = {"value": mood_value, "timestamp": timestamp()}
             return dedupe_facts(existing_facts)
 
-    # Fallback: use LLM for other explicit self-facts
+    if not any(re.search(pat, user_input_lower) for pat in SELF_FACT_PATTERNS + MOOD_PATTERNS):
+        return existing_facts
+
     extract_system_prompt = '''
 You are a fact extractor.
 ONLY record facts that the USER explicitly states about THEMSELVES.
-
 Strict rules:
-- Only record facts phrased with clear self-reference:
-    • "I am...", "I'm...", "My name is..."
-    • "I like/love/enjoy...", "I hate/dislike..."
-    • "I play...", "I watch...", "I read..."
-    • "I eat...", "I drink..."
-    • "I live in...", "I'm from..."
-    • "I work as...", "My job is..."
-    • "I know how to...", "I'm good at..."
+- Only record facts phrased with clear self-reference.
 - Do NOT infer or guess facts.
-- Do NOT record facts about other people, fictional characters, or places unless explicitly tied to the user.
 - Categories allowed: Name, Age, Gender, Location, Nationality, Ethnicity,
   FormerJob, CurrentJob, Hobby, Interest, Preference, Dislike, Trait, Skill, Education,
   RelationshipStatus, Pet, Mood.
-
 Output:
 - Valid JSON with only NEW or UPDATED facts.
 - If no facts apply, return {}.
 '''
-
     extract_prompt = f'''
 USER INPUT:
 "{user_input}"
@@ -228,7 +175,6 @@ CURRENT FACTS (JSON):
 Return only the new or updated facts (not the full set).
 Return valid JSON.
 '''
-
     response = ollama.chat(
         model=MODEL_NAME,
         messages=[
@@ -236,16 +182,13 @@ Return valid JSON.
             {"role": "user", "content": extract_prompt}
         ]
     )
-
     try:
         new_facts = json.loads(response["message"]["content"])
     except (json.JSONDecodeError, KeyError):
         return existing_facts
-
     merged = merge_facts(existing_facts, new_facts)
     return dedupe_facts(merged)
 
-# ---------------- Prompt Builder ----------------
 IMPORTANT_KEYS = {"Name", "Age", "Location", "Mood", "Preference", "Dislike"}
 
 def summarize_facts(facts, per_category=3):
@@ -270,7 +213,12 @@ def extract_value(v):
         return v.get("value", ""), v.get("timestamp", "")
     return v, ""
 
-# ---------------- Chat Loop ----------------
+def typewriter_stream(text, delay=0.02):
+    for char in text:
+        sys.stdout.write(char)
+        sys.stdout.flush()
+        time.sleep(delay + random.uniform(0, 0.01))
+
 def chat():
     history = deque(load_json(SAVE_FILE, {}).get("history", []), maxlen=MEMORY_SIZE)
     facts = normalize_facts(load_json(FACTS_FILE, {}))
@@ -282,22 +230,40 @@ def chat():
             save_json(FACTS_FILE, facts)
             sys.exit(0)
 
+        facts_result = {"value": None}
+        def run_extraction():
+            facts_result["value"] = extract_facts(user_input, facts)
+        extractor_thread = threading.Thread(target=run_extraction)
+        extractor_thread.start()
+
+        print("bot is thinking...", end="", flush=True)
+
         prompt = build_prompt(user_input, history, facts)
-        response = ollama.chat(
+        ai_output = ""
+        first_chunk = True
+        for event in ollama.chat(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
-            ]
-        )
-        ai_output = response["message"]["content"].strip()
-        print(f"bot: {ai_output}")
-        history.append({"user": user_input, "bot": ai_output})
+            ],
+            stream=True
+        ):
+            if "message" in event and "content" in event["message"]:
+                if first_chunk:
+                    sys.stdout.write("\r" + " " * len("bot is thinking...") + "\r")
+                    sys.stdout.flush()
+                    first_chunk = False
+                chunk = event["message"]["content"]
+                ai_output += chunk
+                typewriter_stream(chunk)
+        print()
 
-        # Extract only explicit self-facts
-        facts = extract_facts(user_input, facts)
+        history.append({"user": user_input, "bot": ai_output.strip()})
+        extractor_thread.join()
+        if facts_result["value"] is not None:
+            facts = facts_result["value"]
 
-        # Print facts
         if facts:
             print("\n[facts about user]")
             for k, v in facts.items():
