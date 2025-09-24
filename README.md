@@ -1,7 +1,7 @@
-# Chatbot
+# chatbot-simple
 
 Command-line interface for conversational chatbot with Ollama.
 
 `pip install ollama`
 
-Run as `python chatboy-simple.py`
+Run as `python chatbot-simple.py`
