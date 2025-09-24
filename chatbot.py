@@ -6,18 +6,17 @@ from collections import deque
 from datetime import datetime
 import ollama
 
-# ----------------- Configuration -----------------
-MODEL_NAME = "mistral"
-SAVE_FILE = "conversation.json"  # conversation history
-FACTS_FILE = "important_facts.json"  # long-term important facts
-MEMORY_SIZE = 2  # short-term conversation turns
+MODEL_NAME = "mistral" # whatever ollama model name
+SAVE_FILE = "conversation.json"  # conversational history
+FACTS_FILE = "important_facts.json"  # long-term important facts, pruned by significance
+MEMORY_SIZE = 10  # short-term conversation turns
+MAX_FACTS = 10   # maximum facts saved before pruning
 SYSTEM_PROMPT = '''
 You are a friendly, relaxed, and conversational chatbot.
 Your goal is to keep the user engaged and respond like a thoughtful friend.
 Keep responses clear, natural, and casual. Show understanding, curiosity, or light humor.
 '''
 
-# ----------------- Utility Functions -----------------
 def timestamp():
     return datetime.utcnow().isoformat()
 
@@ -54,43 +53,87 @@ def human_readable_time_diff(last_time_str):
     except Exception:
         return None
 
-# ----------------- Memory Management -----------------
+def score_fact(key, value, provided_score=None):
+    """
+    Assigns significance to a fact.
+    - Use LLM-provided score if available.
+    - If value == 'Unknown', force very low score.
+    - Otherwise fallback to neutral default.
+    """
+    if not value or str(value).lower() == "unknown":
+        return 10
+    if provided_score is not None:
+        return provided_score
+    return 50  # neutral default
+
+def prune_facts(facts):
+    """Keep only the top N facts by significance (breaking ties by recency)."""
+    all_facts = []
+    for k, v in facts.items():
+        if isinstance(v, dict):
+            all_facts.append((k, v))
+        elif isinstance(v, list):
+            for entry in v:
+                all_facts.append((k, entry))
+
+    # Sort by significance, then timestamp (newest first)
+    all_facts.sort(
+        key=lambda x: (x[1].get("significance", 0), x[1].get("timestamp", "")),
+        reverse=True
+    )
+
+    # Trim to MAX_FACTS
+    kept = all_facts[:MAX_FACTS]
+
+    # Rebuild dict
+    new_facts = {}
+    for k, entry in kept:
+        if k not in new_facts:
+            new_facts[k] = entry
+        else:
+            if not isinstance(new_facts[k], list):
+                new_facts[k] = [new_facts[k]]
+            new_facts[k].append(entry)
+    return new_facts
+
 def merge_facts(existing, new):
-    """Merge new facts with per-item timestamps, handling nested dicts correctly."""
+    """Merge new facts with per-item timestamps and significance."""
     for k, v in new.items():
         if not v:
             continue
-        # Determine timestamp and value
+
         if isinstance(v, dict) and "value" in v:
             val = v["value"]
             ts = v.get("timestamp", timestamp())
+            sig = score_fact(k, val, v.get("significance"))
         else:
             val = v
             ts = timestamp()
+            sig = score_fact(k, val)
 
         # Flatten list values into individual items
         if isinstance(val, list):
             for item in val:
-                # If item is already a dict with timestamp, pass as-is
                 if isinstance(item, dict) and "value" in item and "timestamp" in item:
                     merge_facts(existing, {k: item})
                 else:
-                    merge_facts(existing, {k: {"value": item, "timestamp": ts}})
+                    merge_facts(existing, {k: {"value": item, "timestamp": ts, "significance": sig}})
             continue
 
         # Handle existing multi-item categories
         if k in existing:
             if isinstance(existing[k], list):
                 if not any(entry["value"] == val for entry in existing[k]):
-                    existing[k].append({"value": val, "timestamp": ts})
+                    existing[k].append({"value": val, "timestamp": ts, "significance": sig})
             elif isinstance(existing[k], dict):
-                existing[k] = [existing[k], {"value": val, "timestamp": ts}]
+                existing[k] = [existing[k], {"value": val, "timestamp": ts, "significance": sig}]
         else:
-            # If val is already a dict with its own timestamp, store as-is
             if isinstance(val, dict) and "timestamp" in val:
+                if "significance" not in val:
+                    val["significance"] = sig
                 existing[k] = val
             else:
-                existing[k] = {"value": val, "timestamp": ts}
+                existing[k] = {"value": val, "timestamp": ts, "significance": sig}
     return existing
 
 def dedupe_facts(facts):
@@ -115,17 +158,13 @@ def summarize_facts(facts):
     for k, v in facts.items():
         if isinstance(v, dict) and v.get("value"):
             val = v["value"]
-            if isinstance(val, dict):
-                val = json.dumps(val)
-            summary.append(f"- {k}: {val}")
+            summary.append(f"- {k}: {val} (sig: {v.get('significance',0)})")
         elif isinstance(v, list):
             for entry in v:
                 val = entry.get("value")
                 ts = entry.get("timestamp")
-                if isinstance(val, dict):
-                    val = json.dumps(val)
                 if val:
-                    summary.append(f"- {k}: {val} (timestamp: {ts})")
+                    summary.append(f"- {k}: {val} (timestamp: {ts}, sig: {entry.get('significance',0)})")
     return "\n".join(summary)
 
 def build_prompt(user_input, history, facts):
@@ -134,17 +173,33 @@ def build_prompt(user_input, history, facts):
     conversation.append(f"user: {user_input}\nbot:")
     return f"Saved important facts about the user:\n{fact_summary}\n\nCurrent conversation:\n" + "\n".join(conversation)
 
-# ----------------- Fact Extraction -----------------
 def extract_important_facts(user_input, existing_facts):
     """
     Ask the LLM to identify only personally meaningful facts about the user.
-    Conservative: do NOT record facts about other people, shows, or events.
+    - Each fact must have { "value": ..., "significance": int 0-100, "timestamp": optional }.
+    - Do not fabricate facts.
+    - Do not insert placeholders like "Unknown".
+    - Return only valid JSON with new or updated facts.
     """
     extract_system_prompt = '''
 You are a careful fact extractor.
-- Record facts that the USER explicitly states about THEMSELVES.
-- If the input does not contain any facts, return {}.
-- Return ONLY valid JSON with new or updated facts.
+Rules:
+- Record facts the USER explicitly states about THEMSELVES.
+- For each fact, include:
+  - "value": the stated information
+  - "significance": integer 0–100 (100 = extremely important, 0 = trivial)
+  - "timestamp": current UTC time in ISO 8601 format
+- Return facts as a flat JSON object, e.g.:
+
+{
+  "Name": { "value": "Alice", "significance": 100, "timestamp": "2025-09-24T14:27:25.553946" },
+  "Age": { "value": "32", "significance": 80, "timestamp": "2025-09-24T14:27:25.553946" }
+}
+
+- Never invent or insert placeholder values like "Unknown".
+- If there are no new facts, return {}.
+- Do not wrap the output in extra keys like "CURRENT_IMPORTANT_FACTS".
+- Return ONLY valid JSON.
 '''
     extract_prompt = f'''
 USER INPUT:
@@ -163,7 +218,6 @@ Return new or updated facts only in JSON.
                 {"role": "user", "content": extract_prompt}
             ]
         )
-        # Debug: print raw LLM output
         print("\n[DEBUG] Extracted raw facts from LLM:")
         print(response["message"]["content"])
         new_facts = json.loads(response["message"]["content"])
@@ -171,9 +225,9 @@ Return new or updated facts only in JSON.
         return existing_facts
 
     merged = merge_facts(existing_facts, new_facts)
-    return dedupe_facts(merged)
+    deduped = dedupe_facts(merged)
+    return prune_facts(deduped)
 
-# ----------------- Main Chat Loop -----------------
 def chat():
     save_data = load_json(SAVE_FILE, {})
     history = deque(save_data.get("history", []), maxlen=MEMORY_SIZE)
@@ -199,7 +253,6 @@ def chat():
 
         facts_result = {"value": None}
 
-        # Extract important facts in a separate thread
         def run_extraction():
             facts_result["value"] = extract_important_facts(user_input, facts)
 
@@ -247,19 +300,16 @@ def chat():
                 if isinstance(v, dict):
                     val = v.get("value")
                     ts = v.get("timestamp")
-                    if isinstance(val, dict):
-                        val = json.dumps(val)
+                    sig = v.get("significance", 0)
                     if val:
-                        print(f"- {k}: {val} (timestamp: {ts})")
+                        print(f"- {k}: {val} (timestamp: {ts}, sig: {sig})")
                 elif isinstance(v, list):
                     for entry in v:
                         val = entry.get("value")
                         ts = entry.get("timestamp")
-                        if isinstance(val, dict):
-                            val = json.dumps(val)
+                        sig = entry.get("significance", 0)
                         if val:
-                            print(f"- {k}: {val} (timestamp: {ts})")
+                            print(f"- {k}: {val} (timestamp: {ts}, sig: {sig})")
 
-# ----------------- Entry Point -----------------
 if __name__ == "__main__":
     chat()
