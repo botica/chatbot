@@ -3,31 +3,21 @@ import sys
 import time
 import threading
 from collections import deque
-import ollama
 from datetime import datetime
-import re
+import ollama
 
-MODEL_NAME = 'mistral'
-SAVE_FILE = 'conversation.json'
-FACTS_FILE = 'facts.json'
-MEMORY_SIZE = 6
-
+# ----------------- Configuration -----------------
+MODEL_NAME = "mistral"
+SAVE_FILE = "conversation.json"  # conversation history
+FACTS_FILE = "important_facts.json"  # long-term important facts
+MEMORY_SIZE = 2  # short-term conversation turns
 SYSTEM_PROMPT = '''
-You are a lively, witty, and engaging conversational partner. 
-Your goal is to keep the user interested with natural, flowing dialogue. 
-
-Guidelines:
-- Respond in a friendly, casual tone (like a clever friend, not a customer support agent).
-- Avoid repeating the same closing lines (no constant "take care" or "let me know").
-- Add small insights, humor, curiosity, or playful observations to keep things fresh.
-- Vary your style: sometimes ask a follow-up question, sometimes share a quick thought or fact, sometimes just react naturally.
-- Occasionally shift your tone or style every few turns: ask a quirky question, share a surprising fact, or react differently.
-- Keep responses concise (max ~5 lines) but engaging.
-- Acknowledge the user's facts and feelings without parroting them.
-- Remember context from previous messages and known facts about the user to make responses more relevant.
-- Make the conversation feel dynamic, not scripted or repetitive.
+You are a friendly, relaxed, and conversational chatbot.
+Your goal is to keep the user engaged and respond like a thoughtful friend.
+Keep responses clear, natural, and casual. Show understanding, curiosity, or light humor.
 '''
 
+# ----------------- Utility Functions -----------------
 def timestamp():
     return datetime.utcnow().isoformat()
 
@@ -42,198 +32,11 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def normalize_facts(facts):
-    def normalize_entry(entry):
-        if isinstance(entry, str):
-            return {"value": entry, "timestamp": timestamp()}
-        elif isinstance(entry, dict):
-            if "value" in entry and "timestamp" in entry:
-                val = entry["value"]
-                ts = entry["timestamp"]
-                if isinstance(val, dict):
-                    val = normalize_entry(val)["value"]
-                return {"value": val, "timestamp": ts}
-            return {k: normalize_entry(v) for k, v in entry.items()}
-        elif isinstance(entry, list):
-            flat_list = []
-            for e in entry:
-                ne = normalize_entry(e)
-                if isinstance(ne, list):
-                    flat_list.extend(ne)
-                else:
-                    flat_list.append(ne)
-            return flat_list
-        return entry
-    return {k: normalize_entry(v) for k, v in facts.items()}
-
-def merge_facts(existing, new):
-    SINGLETON_CATEGORIES = {"Age", "Name", "Gender", "Location", "Nationality", "Ethnicity", "Mood"}
-    
-    for k, v in new.items():
-        if isinstance(v, list):
-            for item in v:
-                merge_facts(existing, {k: item})
-            continue
-        
-        fact_value = v["value"] if isinstance(v, dict) and "value" in v else v
-        new_fact = {"value": fact_value, "timestamp": timestamp()}
-        
-        # Always overwrite singleton facts with the latest
-        if k in SINGLETON_CATEGORIES:
-            existing[k] = new_fact
-            continue
-
-        # Handle Preference/Dislike conflicts
-        if k == "Preference" and "Dislike" in existing:
-            if isinstance(existing["Dislike"], list):
-                existing["Dislike"] = [d for d in existing["Dislike"] if d["value"] != fact_value]
-                if not existing["Dislike"]:
-                    del existing["Dislike"]
-            elif existing["Dislike"]["value"] == fact_value:
-                del existing["Dislike"]
-        elif k == "Dislike" and "Preference" in existing:
-            if isinstance(existing["Preference"], list):
-                existing["Preference"] = [p for p in existing["Preference"] if p["value"] != fact_value]
-                if not existing["Preference"]:
-                    del existing["Preference"]
-            elif existing["Preference"]["value"] == fact_value:
-                del existing["Preference"]
-
-        # Merge lists or create new entries
-        if k in existing:
-            if isinstance(existing[k], dict):
-                existing[k] = [existing[k]]
-            flat_list = []
-            for entry in existing[k]:
-                if isinstance(entry, list):
-                    flat_list.extend(entry)
-                else:
-                    flat_list.append(entry)
-            existing[k] = flat_list
-            if all(entry["value"] != fact_value for entry in existing[k]):
-                existing[k].append(new_fact)
-        else:
-            existing[k] = new_fact
-
-    return existing
-
-def dedupe_facts(facts):
-    for k, v in list(facts.items()):
-        if isinstance(v, list):
-            unique = []
-            seen = []
-            for entry in v:
-                val = entry["value"].strip().lower()
-                if any(val in other or other in val for other in seen):
-                    continue
-                seen.append(val)
-                unique.append(entry)
-            facts[k] = unique
-    return facts
-
-def extract_facts(user_input, existing_facts):
-    user_input_lower = user_input.lower()
-
-    # Negation patterns (do not save if user negates)
-    NEGATION_PATTERNS = [
-        r"(?:don't|do not|never|not)\s+call me\s+([A-Za-z0-9_ ]+)"
-    ]
-    for pat in NEGATION_PATTERNS:
-        if re.search(pat, user_input, re.IGNORECASE):
-            return existing_facts
-
-    # Name patterns (flexible)
-    NAME_PATTERNS = [
-        r"call me\s+([A-Za-z0-9_ ]+)",
-        r"my name is\s+([A-Za-z0-9_ ]+)",
-        r"i go by\s+([A-Za-z0-9_ ]+)",
-        r"i'm called\s+([A-Za-z0-9_ ]+)",
-        r"i am called\s+([A-Za-z0-9_ ]+)"
-    ]
-    for pat in NAME_PATTERNS:
-        match = re.search(pat, user_input, re.IGNORECASE)
-        if match:
-            name_value = match.group(1).strip()
-            existing_facts["Name"] = {"value": name_value, "timestamp": timestamp()}
-            return dedupe_facts(existing_facts)
-
-    # Mood patterns (single-word only)
-    MOOD_PATTERNS = [
-        r"\bi feel(?: like)?\s+([a-zA-Z]+)\b",
-        r"\bi felt\s+([a-zA-Z]+)\b",
-        r"\bthat made me\s+([a-zA-Z]+)\b",
-        r"\bi am\s+(?:feeling\s+)?([a-zA-Z]+)\b",
-        r"\bi'm\s+(?:feeling\s+)?([a-zA-Z]+)\b"
-    ]
-    for pat in MOOD_PATTERNS:
-        mood_match = re.search(pat, user_input, re.IGNORECASE)
-        if mood_match:
-            mood_value = mood_match.group(1).strip()
-            existing_facts["Mood"] = {"value": mood_value, "timestamp": timestamp()}
-            return dedupe_facts(existing_facts)
-
-    # Fallback: use LLM extraction
-    extract_system_prompt = '''
-You are a fact extractor.
-ONLY record facts that the USER explicitly states about THEMSELVES.
-Strict rules:
-- Only record facts phrased with clear self-reference.
-- Do NOT infer or guess facts.
-- Categories allowed: Name, Age, Gender, Location, Nationality, Ethnicity,
-  FormerJob, CurrentJob, Hobby, Interest, Preference, Dislike, Trait, Skill, Education,
-  RelationshipStatus, Pet, Mood.
-Output:
-- Valid JSON with only NEW or UPDATED facts.
-- If no facts apply, return {}.
-'''
-    extract_prompt = f'''
-USER INPUT:
-"{user_input}"
-
-CURRENT FACTS (JSON):
-{json.dumps(existing_facts, indent=2)}
-
-Return only the new or updated facts (not the full set).
-Return valid JSON.
-'''
-    response = ollama.chat(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": extract_system_prompt},
-            {"role": "user", "content": extract_prompt}
-        ]
-    )
-    try:
-        new_facts = json.loads(response["message"]["content"])
-    except (json.JSONDecodeError, KeyError):
-        return existing_facts
-
-    merged = merge_facts(existing_facts, new_facts)
-    return dedupe_facts(merged)
-
-IMPORTANT_KEYS = {"Name", "Age", "Location", "Mood", "Preference", "Dislike"}
-
-def summarize_facts(facts, per_category=3):
-    summary = []
-    for k, v in facts.items():
-        if k in IMPORTANT_KEYS:
-            if isinstance(v, list):
-                recent = sorted(v, key=lambda e: e["timestamp"], reverse=True)[:per_category]
-                summary.extend([f"- {k}: {entry['value']}" for entry in recent])
-            elif isinstance(v, dict):
-                summary.append(f"- {k}: {v['value']}")
-    return "\n".join(summary)
-
-def build_prompt(user_input, history, facts):
-    fact_summary = summarize_facts(facts)
-    conversation = [f"user: {t['user']}\nbot: {t['bot']}" for t in history]
-    conversation.append(f"user: {user_input}\nbot:")
-    return f"Saved facts about user:\n{fact_summary}\n\nCurrent conversation:\n" + "\n".join(conversation)
-
-def extract_value(v):
-    if isinstance(v, dict):
-        return v.get("value", ""), v.get("timestamp", "")
-    return v, ""
+def typewriter_stream(text, delay=0.02):
+    for char in text:
+        sys.stdout.write(char)
+        sys.stdout.flush()
+        time.sleep(delay)
 
 def human_readable_time_diff(last_time_str):
     try:
@@ -251,18 +54,131 @@ def human_readable_time_diff(last_time_str):
     except Exception:
         return None
 
-def typewriter_stream(text, delay=0.02):
-    for char in text:
-        sys.stdout.write(char)
-        sys.stdout.flush()
-        time.sleep(delay)
+# ----------------- Memory Management -----------------
+def merge_facts(existing, new):
+    """Merge new facts with per-item timestamps, handling nested dicts correctly."""
+    for k, v in new.items():
+        if not v:
+            continue
+        # Determine timestamp and value
+        if isinstance(v, dict) and "value" in v:
+            val = v["value"]
+            ts = v.get("timestamp", timestamp())
+        else:
+            val = v
+            ts = timestamp()
 
+        # Flatten list values into individual items
+        if isinstance(val, list):
+            for item in val:
+                # If item is already a dict with timestamp, pass as-is
+                if isinstance(item, dict) and "value" in item and "timestamp" in item:
+                    merge_facts(existing, {k: item})
+                else:
+                    merge_facts(existing, {k: {"value": item, "timestamp": ts}})
+            continue
+
+        # Handle existing multi-item categories
+        if k in existing:
+            if isinstance(existing[k], list):
+                if not any(entry["value"] == val for entry in existing[k]):
+                    existing[k].append({"value": val, "timestamp": ts})
+            elif isinstance(existing[k], dict):
+                existing[k] = [existing[k], {"value": val, "timestamp": ts}]
+        else:
+            # If val is already a dict with its own timestamp, store as-is
+            if isinstance(val, dict) and "timestamp" in val:
+                existing[k] = val
+            else:
+                existing[k] = {"value": val, "timestamp": ts}
+    return existing
+
+def dedupe_facts(facts):
+    """Remove duplicate values for multi-valued facts (if any)."""
+    for k, v in list(facts.items()):
+        if isinstance(v, dict):
+            continue
+        elif isinstance(v, list):
+            unique = {}
+            for entry in v:
+                if isinstance(entry, dict):
+                    val = entry.get("value")
+                    ts = entry.get("timestamp", "")
+                    val_key = str(val).lower()
+                    if val_key not in unique or ts > unique[val_key].get("timestamp", ""):
+                        unique[val_key] = entry
+            facts[k] = list(unique.values())
+    return facts
+
+def summarize_facts(facts):
+    summary = []
+    for k, v in facts.items():
+        if isinstance(v, dict) and v.get("value"):
+            val = v["value"]
+            if isinstance(val, dict):
+                val = json.dumps(val)
+            summary.append(f"- {k}: {val}")
+        elif isinstance(v, list):
+            for entry in v:
+                val = entry.get("value")
+                ts = entry.get("timestamp")
+                if isinstance(val, dict):
+                    val = json.dumps(val)
+                if val:
+                    summary.append(f"- {k}: {val} (timestamp: {ts})")
+    return "\n".join(summary)
+
+def build_prompt(user_input, history, facts):
+    fact_summary = summarize_facts(facts)
+    conversation = [f"user: {t['user']}\nbot: {t['bot']}" for t in history]
+    conversation.append(f"user: {user_input}\nbot:")
+    return f"Saved important facts about the user:\n{fact_summary}\n\nCurrent conversation:\n" + "\n".join(conversation)
+
+# ----------------- Fact Extraction -----------------
+def extract_important_facts(user_input, existing_facts):
+    """
+    Ask the LLM to identify only personally meaningful facts about the user.
+    Conservative: do NOT record facts about other people, shows, or events.
+    """
+    extract_system_prompt = '''
+You are a careful fact extractor.
+- Record facts that the USER explicitly states about THEMSELVES.
+- If the input does not contain any facts, return {}.
+- Return ONLY valid JSON with new or updated facts.
+'''
+    extract_prompt = f'''
+USER INPUT:
+"{user_input}"
+
+CURRENT IMPORTANT FACTS (JSON):
+{json.dumps(existing_facts, indent=2)}
+
+Return new or updated facts only in JSON.
+'''
+    try:
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": extract_system_prompt},
+                {"role": "user", "content": extract_prompt}
+            ]
+        )
+        # Debug: print raw LLM output
+        print("\n[DEBUG] Extracted raw facts from LLM:")
+        print(response["message"]["content"])
+        new_facts = json.loads(response["message"]["content"])
+    except Exception:
+        return existing_facts
+
+    merged = merge_facts(existing_facts, new_facts)
+    return dedupe_facts(merged)
+
+# ----------------- Main Chat Loop -----------------
 def chat():
     save_data = load_json(SAVE_FILE, {})
     history = deque(save_data.get("history", []), maxlen=MEMORY_SIZE)
-    facts = normalize_facts(load_json(FACTS_FILE, {}))
+    facts = load_json(FACTS_FILE, {})
 
-    # Show last chat info if available
     last_chat_time = save_data.get("last_chat_time")
     if last_chat_time:
         diff_str = human_readable_time_diff(last_chat_time)
@@ -282,11 +198,15 @@ def chat():
             sys.exit(0)
 
         facts_result = {"value": None}
+
+        # Extract important facts in a separate thread
         def run_extraction():
-            facts_result["value"] = extract_facts(user_input, facts)
+            facts_result["value"] = extract_important_facts(user_input, facts)
+
         extractor_thread = threading.Thread(target=run_extraction)
         extractor_thread.start()
 
+        # Build prompt for response
         print("bot is thinking...", end="", flush=True)
         prompt = build_prompt(user_input, history, facts)
         ai_output = ""
@@ -314,23 +234,32 @@ def chat():
         if facts_result["value"] is not None:
             facts = facts_result["value"]
 
-        # Save after each turn
+        # Save state
         save_data["history"] = list(history)
         save_data["last_chat_time"] = timestamp()
         save_json(SAVE_FILE, save_data)
         save_json(FACTS_FILE, facts)
 
-        # Print current facts
+        # Print important facts
         if facts:
-            print("\n[facts about user]")
+            print("\n[important facts about user]")
             for k, v in facts.items():
-                if isinstance(v, list):
-                    for entry in v:
-                        val, ts = extract_value(entry)
+                if isinstance(v, dict):
+                    val = v.get("value")
+                    ts = v.get("timestamp")
+                    if isinstance(val, dict):
+                        val = json.dumps(val)
+                    if val:
                         print(f"- {k}: {val} (timestamp: {ts})")
-                else:
-                    val, ts = extract_value(v)
-                    print(f"- {k}: {val} (timestamp: {ts})")
+                elif isinstance(v, list):
+                    for entry in v:
+                        val = entry.get("value")
+                        ts = entry.get("timestamp")
+                        if isinstance(val, dict):
+                            val = json.dumps(val)
+                        if val:
+                            print(f"- {k}: {val} (timestamp: {ts})")
 
+# ----------------- Entry Point -----------------
 if __name__ == "__main__":
     chat()
